@@ -10,6 +10,7 @@ from qwen_vl_utils import process_vision_info
 
 
 import torch
+torch.backends.cuda.matmul.allow_tf32 = True
 
 # ======================
 # 使用第二张4090
@@ -41,8 +42,17 @@ processor = AutoProcessor.from_pretrained(
 DATASET_DIR = "dataset"
 OUTPUT_JSON = "output/result.json"
 
-# 保存结果
-results = {}
+# ======================
+# 自动断点续跑
+# ======================
+
+if os.path.exists(OUTPUT_JSON):
+    with open(OUTPUT_JSON, "r", encoding="utf-8") as f:
+        results = json.load(f)
+
+    print(f"检测到已有结果：{len(results)} 条")
+else:
+    results = {}
 
 # ======================
 # 3. 遍历图片
@@ -53,7 +63,9 @@ image_files = [
     if f.lower().endswith((".jpg", ".png", ".jpeg"))
 ]
 
-for image_name in tqdm(image_files):
+for idx, image_name in enumerate(tqdm(image_files)):
+    if image_name in results:
+        continue
 
     image_path = os.path.join(DATASET_DIR, image_name)
 
@@ -95,12 +107,12 @@ for image_name in tqdm(image_files):
         return_tensors="pt",
     )
 
-    inputs = inputs.to("cuda")
+    inputs = inputs.to(model.device)
 
     # 推理
     generated_ids = model.generate(
         **inputs,
-        max_new_tokens=1024
+        max_new_tokens=256
     )
 
     generated_ids_trimmed = [
@@ -116,6 +128,15 @@ for image_name in tqdm(image_files):
 
     # 保存
     results[image_name] = output_text
+    # 每10张自动保存一次
+    if idx % 10 == 0:
+
+        os.makedirs("output", exist_ok=True)
+
+        with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=4)
+
+        print(f"已保存 {len(results)} 条结果")
 
 # ======================
 # 4. 保存JSON
