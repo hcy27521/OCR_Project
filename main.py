@@ -1,27 +1,32 @@
 import os
 import json
-from PIL import Image
 from tqdm import tqdm
+
+import torch
+
 from transformers import (
     Qwen2_5_VLForConditionalGeneration,
     AutoProcessor
 )
+
 from qwen_vl_utils import process_vision_info
 
+# =====================================================
+# GPU优化
+# =====================================================
 
-import torch
 torch.backends.cuda.matmul.allow_tf32 = True
-
-# ======================
-# 使用第二张4090
-# ======================
-
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
-# ======================
-# 1. 加载模型
-# ======================
+# =====================================================
+# 模型路径
+# =====================================================
+
 MODEL_PATH = "./Qwen2.5-VL-3B-Instruct"
+
+# =====================================================
+# 加载模型
+# =====================================================
 
 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
     MODEL_PATH,
@@ -35,112 +40,176 @@ processor = AutoProcessor.from_pretrained(
     local_files_only=True
 )
 
-# ======================
-# 2. 数据路径
-# ======================
+print("模型加载成功！")
+
+# =====================================================
+# 数据路径
+# =====================================================
 
 DATASET_DIR = "dataset"
 OUTPUT_JSON = "output/result.json"
 
-# ======================
+# =====================================================
 # 自动断点续跑
-# ======================
+# =====================================================
 
 if os.path.exists(OUTPUT_JSON):
+
     with open(OUTPUT_JSON, "r", encoding="utf-8") as f:
         results = json.load(f)
 
     print(f"检测到已有结果：{len(results)} 条")
+
 else:
+
     results = {}
 
-# ======================
-# 3. 遍历图片
-# ======================
+# =====================================================
+# 获取图片列表
+# =====================================================
 
-image_files = [
+image_files = sorted([
     f for f in os.listdir(DATASET_DIR)
     if f.lower().endswith((".jpg", ".png", ".jpeg"))
-]
+])
+
+print(f"共检测到 {len(image_files)} 张图片")
+
+# =====================================================
+# OCR识别
+# =====================================================
 
 for idx, image_name in enumerate(tqdm(image_files)):
+
+    # 跳过已经识别的图片
     if image_name in results:
         continue
 
-    image_path = os.path.join(DATASET_DIR, image_name)
+    try:
 
-    # 构造消息
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "image": image_path,
-                },
-                {
-                    "type": "text",
-                    "text": (
-                        "请识别图片中的全部内容。"
-                        "数学公式请转换为 LaTeX 格式。"
-                        "只输出识别结果，不要解释。"
-                    )
-                },
-            ],
-        }
-    ]
+        image_path = os.path.join(DATASET_DIR, image_name)
 
-    # 处理输入
-    text = processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
+        # =================================================
+        # 构造Prompt
+        # =================================================
 
-    image_inputs, video_inputs = process_vision_info(messages)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "image": image_path,
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "你是OCR文字识别系统。"
+                            "请逐字识别图片中的所有文字内容。"
+                            "不要总结。"
+                            "不要推理。"
+                            "不要补充答案。"
+                            "不要猜测缺失内容。"
+                            "保持原题格式。"
+                            "数学公式转换为LaTeX格式。"
+                            "只输出图片中真实存在的文本。"
+                        )
+                    },
+                    
+                ],
+            }
+        ]
 
-    inputs = processor(
-        text=[text],
-        images=image_inputs,
-        videos=video_inputs,
-        padding=True,
-        return_tensors="pt",
-    )
+        # =================================================
+        # 处理输入
+        # =================================================
 
-    inputs = inputs.to(model.device)
+        text = processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
 
-    # 推理
-    generated_ids = model.generate(
-        **inputs,
-        max_new_tokens=256
-    )
+        image_inputs, video_inputs = process_vision_info(messages)
 
-    generated_ids_trimmed = [
-        out_ids[len(in_ids):]
-        for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-    ]
+        inputs = processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
 
-    output_text = processor.batch_decode(
-        generated_ids_trimmed,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False
-    )[0]
+        # 放到模型所在设备
+        inputs = inputs.to(model.device)
 
-    # 保存
-    results[image_name] = output_text
-    # 每10张自动保存一次
-    if idx % 10 == 0:
+        # =================================================
+        # 模型推理
+        # =================================================
 
-        os.makedirs("output", exist_ok=True)
+        with torch.no_grad():
 
+            generated_ids = model.generate(
+                **inputs,
+                max_new_tokens=1024,
+                do_sample=False,
+                temperature=0
+            )
+
+        # =================================================
+        # 解码输出
+        # =================================================
+
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):]
+            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+
+        output_text = processor.batch_decode(
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False
+        )[0]
+
+        # =================================================
+        # 文本清理
+        # =================================================
+
+        output_text = output_text.replace("\n", " ")
+        output_text = " ".join(output_text.split())
+
+        # 保存结果
+        results[image_name] = output_text
+
+        # =================================================
+        # 每10张自动保存
+        # =================================================
+
+        if len(results) % 10 == 0:
+
+            os.makedirs("output", exist_ok=True)
+
+            with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
+                json.dump(results, f, ensure_ascii=False, indent=4)
+
+            print(f"已保存 {len(results)} 条结果")
+
+    except Exception as e:
+
+        print(f"{image_name} 出错: {e}")
+
+        # 错误记录
+        results[image_name] = "ERROR"
+
+        # 出错也保存
         with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=4)
 
-        print(f"已保存 {len(results)} 条结果")
+        continue
 
-# ======================
-# 4. 保存JSON
-# ======================
+# =====================================================
+# 最终保存
+# =====================================================
 
 os.makedirs("output", exist_ok=True)
 
