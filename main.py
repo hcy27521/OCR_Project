@@ -6,7 +6,7 @@ import torch
 
 from transformers import (
     Qwen2_5_VLForConditionalGeneration,
-    AutoProcessor
+    AutoProcessor  # 自动处理器，用于图像和文本的预处理
 )
 
 from qwen_vl_utils import process_vision_info
@@ -35,6 +35,7 @@ model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
     local_files_only=True
 )
 
+# 加载处理器：负责图像尺寸调整、文本分词、模板应用等
 processor = AutoProcessor.from_pretrained(
     MODEL_PATH,
     local_files_only=True
@@ -52,7 +53,7 @@ OUTPUT_JSON = "output/result.json"
 # =====================================================
 # 自动断点续跑
 # =====================================================
-
+# 如果输出 JSON 文件已经存在，则加载已有结果，实现中断后继续处理（不重复识别已完成的图片）
 if os.path.exists(OUTPUT_JSON):
 
     with open(OUTPUT_JSON, "r", encoding="utf-8") as f:
@@ -123,13 +124,13 @@ for idx, image_name in enumerate(tqdm(image_files)):
         # =================================================
         # 处理输入
         # =================================================
-
+        # 将 messages 格式化为模型所需的文本字符串（包括特殊标记）
         text = processor.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True
         )
-
+        # 从 messages 中提取图像/视频的底层数据（如像素值、尺寸等），供 processor 使用
         image_inputs, video_inputs = process_vision_info(messages)
 
         inputs = processor(
